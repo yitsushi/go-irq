@@ -2,61 +2,28 @@ package irq
 
 import (
 	"context"
-	"fmt"
 	"sync"
 
 	"github.com/sirupsen/logrus"
 )
 
-type InterruptRequestIDAlreadyTakenError struct {
-	ID uint
-}
-
-func (e InterruptRequestIDAlreadyTakenError) Error() string {
-	return fmt.Sprintf("irq id is already taken: %d", e.ID)
-}
-
-type ReservedInterruptREquestIDError struct {
-	ID uint
-}
-
-func (e ReservedInterruptREquestIDError) Error() string {
-	return fmt.Sprintf("reserved irq id: %d", e.ID)
-}
-
-type App interface {
-	Boot(fn AttachProcessFunc)
-	Start(ctx context.Context, irqChannel MessageBus, fn RequestMemSegFunc)
-}
-
-type Memory struct {
-	Data interface{}
-}
-
 type MessageBus <-chan uint
-type ProcessFunc func(ctx context.Context, interrupt func(), memory *Memory)
+type APIFunc func(name string, payload interface{}) (interface{}, error)
+type ProcessFunc func(ctx context.Context, data ProcessData)
 type AttachProcessFunc func(requestedID uint, process ProcessFunc) error
-type RequestMemSegFunc func(irq uint) *Memory
-type withFunc func(c *Core)
 
 type Core struct {
 	irqChan    chan uint
 	processMap map[uint]*Memory
-	lock       sync.Mutex
+	mutex      sync.Mutex
 	logger     *logrus.Logger
 }
 
-func WithLogger(logger *logrus.Logger) withFunc {
-	return func(c *Core) {
-		c.logger = logger
-	}
-}
-
-func NewCore(queueSize int, options ...withFunc) *Core {
+func NewCore(queueSize int, options ...WithFunc) *Core {
 	core := &Core{
 		irqChan:    make(chan uint, queueSize),
 		processMap: map[uint]*Memory{},
-		lock:       sync.Mutex{},
+		mutex:      sync.Mutex{},
 	}
 
 	for _, fn := range options {
@@ -71,15 +38,15 @@ func NewCore(queueSize int, options ...withFunc) *Core {
 }
 
 func (core *Core) Boot(app App) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := core.buildContext()
 	defer cancel()
 
 	var wg sync.WaitGroup
 
 	app.Boot(func(requestedID uint, process ProcessFunc) error {
-		return core.AttachProcess(&wg, ctx, requestedID, process)
+		return core.AttachProcess(&wg, ctx, requestedID, process, app.API)
 	})
-	app.Start(ctx, core.irqChan, core.RequestMemorySegment)
+	app.Start(ctx, core.irqChan)
 
 	cancel()
 
@@ -97,15 +64,16 @@ func (core *Core) AttachProcess(
 	ctx context.Context,
 	requestedID uint,
 	process ProcessFunc,
+	api APIFunc,
 ) error {
 	core.logger.Infof("Register IRQ: %d", requestedID)
 
 	if requestedID < 10 {
-		return ReservedInterruptREquestIDError{ID: requestedID}
+		return ReservedInterruptRequestIDError{ID: requestedID}
 	}
 
-	core.lock.Lock()
-	defer core.lock.Unlock()
+	core.mutex.Lock()
+	defer core.mutex.Unlock()
 
 	core.logger.Infof("Find IRQ conflict: %d", requestedID)
 
@@ -123,7 +91,7 @@ func (core *Core) AttachProcess(
 	wg.Add(1)
 
 	go func() {
-		process(ctx, interrupt, core.processMap[requestedID])
+		process(ctx, newProcessData(interrupt, api, core.processMap[requestedID], core.logger))
 		core.logger.Infof("Stopped process with assigned IRQ: %d", requestedID)
 		wg.Done()
 	}()
